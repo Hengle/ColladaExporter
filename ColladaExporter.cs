@@ -1,26 +1,52 @@
 using UnityEngine;
+using UnityEditor;
 using System;
 using System.Xml;
 using System.Text;
+using System.Collections.Generic;
+using System.Linq;
+using System.IO;
 
 /**
  * Collada Exporter
  *
+ * @author      Hiroki Omae
  * @author      Michael Grenier
  * @author_url  http://mgrenier.me
+ * @copyright   2017 (c) Hiroki Omae
  * @copyright   2011 (c) Michael Grenier
  * @license     MIT - http://www.opensource.org/licenses/MIT
- *
- * @example
- *
- *              ColladaExporter export = new ColladaExporter("path/to/export.dae", replace_or_not);
- *              export.AddGeometry("MyMeshId", mesh_object);
- *              export.AddGeometryToScene("MyMeshId", "MyMeshName");
- *              export.Save();
- *
  */
 public class ColladaExporter : IDisposable
 {
+    private class TransformAnimationCurves {
+        public AnimationCurve positionX;
+        public AnimationCurve positionY;
+        public AnimationCurve positionZ;
+
+        public AnimationCurve rotationX;
+        public AnimationCurve rotationY;
+        public AnimationCurve rotationZ;
+        public AnimationCurve rotationW;
+
+        public AnimationCurve scaleX;
+        public AnimationCurve scaleY;
+        public AnimationCurve scaleZ;
+
+        public Matrix4x4 CreateTransformMatrix(int i) {
+            var m = new Matrix4x4 ();
+
+            //convert right-hand system/left-hand system (to-from Collada(right) <-> Unity(left))
+            var position = new Vector3 (-positionX.keys[i].value, positionY.keys[i].value, positionZ.keys[i].value);
+            var rotation = new Quaternion (-rotationX.keys[i].value, rotationY.keys[i].value, rotationZ.keys[i].value, -rotationW.keys[i].value);
+            var scale    = new Vector3 (scaleX.keys[i].value, scaleY.keys[i].value, scaleZ.keys[i].value);
+
+            m.SetTRS (position, rotation, scale);
+
+            return m;
+        }
+    }
+
     protected string path;
     public const string COLLADA = "http://www.collada.org/2005/11/COLLADASchema";
     public XmlDocument xml
@@ -42,6 +68,7 @@ public class ColladaExporter : IDisposable
     protected XmlNode materials;
     protected XmlNode geometries;
     protected XmlNode animations;
+    protected XmlNode animation_clips;
     protected XmlNode controllers;
     protected XmlNode visual_scenes;
     protected XmlNode default_scene;
@@ -158,6 +185,9 @@ public class ColladaExporter : IDisposable
         this.animations = this.root.SelectSingleNode("/x:library_animations", this.nsManager);
         if (this.animations == null)
             this.animations = this.root.AppendChild(this.xml.CreateElement("library_animations", COLLADA));
+        this.animation_clips = this.root.SelectSingleNode("/x:library_animation_clips", this.nsManager);
+        if (this.animation_clips == null)
+            this.animation_clips = this.root.AppendChild(this.xml.CreateElement("library_animation_clips", COLLADA));
         this.controllers = this.root.SelectSingleNode("/x:library_controllers", this.nsManager);
         if (this.controllers == null)
             this.controllers = this.root.AppendChild(this.xml.CreateElement("library_controllers", COLLADA));
@@ -193,7 +223,345 @@ public class ColladaExporter : IDisposable
         this.xml.Save(this.path);
     }
 
-    public XmlNode AddGeometry(string id, Mesh sourceMesh)
+    private string MakeIdFromName(string name) {
+        return name.Replace ('.', '_'); 
+    }
+
+    private void SetIdAttribute(XmlNode node, string id) {
+        SetAttribute (node, "id", id);
+    }
+
+    private void SetAttribute(XmlNode node, string attrName, string attrValue) {
+        XmlAttribute attr = this.xml.CreateAttribute(attrName);
+        attr.Value = attrValue;
+        node.Attributes.Append(attr);
+    }
+
+    private void SetNameIdAttributes(XmlNode node, string type, string name, string id, bool setSID = false) {
+        SetIdAttribute (node, id);
+        if (setSID) {
+            SetAttribute (node, "sid", id);
+        }
+        SetAttribute (node, "type", type);
+        SetAttribute (node, "name", name);
+    }
+
+    private void SetSidAndText(XmlNode node, string sid, string text) {
+        XmlAttribute attr = this.xml.CreateAttribute("sid");
+        attr.Value = sid;
+        node.Attributes.Append(attr);
+        node.AppendChild(this.xml.CreateTextNode(text));
+    }
+
+    private string FormatVector(Vector3 v) {
+        return string.Format ("{0} {1} {2}", v.x, v.y, v.z);
+    }
+
+    private string FormatVector(Vector4 v) {
+        return string.Format ("{0} {1} {2} {3}", v.x, v.y, v.z, v.w);
+    }
+
+    public XmlNode AddAnimationClip(AnimationClip anim, GameObject targetObject) {
+
+        var rootId = targetObject.name;
+        var animID = anim.name;
+
+        XmlNode animationClipNode = this.animation_clips.AppendChild (this.xml.CreateElement ("animation_clip", COLLADA));
+        SetIdAttribute(animationClipNode, animID);
+        SetAttribute(animationClipNode, "name", anim.name);
+        SetAttribute(animationClipNode, "start", "0");
+        SetAttribute(animationClipNode, "end", string.Format("{0:F6}", anim.length));
+
+        var bindings = AnimationUtility.GetCurveBindings (anim);
+
+        var paths = bindings.Select (b => b.path).Distinct ().ToList ();
+
+        for (int i = 0; i < paths.Count; ++i) {
+            var path = paths [i];
+            var transformBindings = bindings.Where (b => b.path == path && b.type == typeof(Transform)).ToArray ();
+            var curves = CreateTransformAnimationCurves (anim, transformBindings);
+
+            var curveId = string.Format ("{0}{1}", animID, i);
+            var jointId = Path.GetFileName(path);
+            if (string.IsNullOrEmpty (jointId)) {
+                jointId = rootId;
+            }
+
+            AddAnimationCurve(curves, curveId, jointId);
+
+            XmlNode instanceAnimation = animationClipNode.AppendChild (this.xml.CreateElement ("instance_animation", COLLADA));
+            SetAttribute(instanceAnimation, "url", string.Format ("#{0}", curveId));
+        }
+
+        return animationClipNode;
+    }
+
+    private TransformAnimationCurves CreateTransformAnimationCurves(AnimationClip anim, EditorCurveBinding[] bindings) {
+        var curves = new TransformAnimationCurves ();
+
+        var positionX = bindings.Where (b => b.propertyName == "m_LocalPosition.x").FirstOrDefault();
+        var positionY = bindings.Where (b => b.propertyName == "m_LocalPosition.y").FirstOrDefault();
+        var positionZ = bindings.Where (b => b.propertyName == "m_LocalPosition.z").FirstOrDefault();
+
+        var rotationX = bindings.Where (b => b.propertyName == "m_LocalRotation.x").FirstOrDefault();
+        var rotationY = bindings.Where (b => b.propertyName == "m_LocalRotation.y").FirstOrDefault();
+        var rotationZ = bindings.Where (b => b.propertyName == "m_LocalRotation.z").FirstOrDefault();
+        var rotationW = bindings.Where (b => b.propertyName == "m_LocalRotation.w").FirstOrDefault();
+
+        var scaleX = bindings.Where (b => b.propertyName == "m_LocalScale.x").FirstOrDefault();
+        var scaleY = bindings.Where (b => b.propertyName == "m_LocalScale.y").FirstOrDefault();
+        var scaleZ = bindings.Where (b => b.propertyName == "m_LocalScale.z").FirstOrDefault();
+
+        curves.positionX = AnimationUtility.GetEditorCurve (anim, positionX);
+        curves.positionY = AnimationUtility.GetEditorCurve (anim, positionY);
+        curves.positionZ = AnimationUtility.GetEditorCurve (anim, positionZ);
+        curves.rotationX = AnimationUtility.GetEditorCurve (anim, rotationX);
+        curves.rotationY = AnimationUtility.GetEditorCurve (anim, rotationY);
+        curves.rotationZ = AnimationUtility.GetEditorCurve (anim, rotationZ);
+        curves.rotationW = AnimationUtility.GetEditorCurve (anim, rotationW);
+        curves.scaleX = AnimationUtility.GetEditorCurve (anim, scaleX);
+        curves.scaleY = AnimationUtility.GetEditorCurve (anim, scaleY);
+        curves.scaleZ = AnimationUtility.GetEditorCurve (anim, scaleZ);
+
+        return curves;
+    }
+
+    private XmlNode AddAnimationCurve(TransformAnimationCurves curves, string curveId, string jointId) {
+
+        XmlNode curveNode = this.animations.AppendChild (this.xml.CreateElement ("animation", COLLADA));
+        SetIdAttribute(curveNode, curveId);
+
+        int keyCount = curves.positionX.length;
+
+        // input
+        string inputID = string.Format ("{0}-input", curveId);
+        {
+            XmlNode inputNode = curveNode.AppendChild (this.xml.CreateElement ("source", COLLADA));
+            SetIdAttribute(inputNode, inputID);
+
+            StringBuilder sb = new StringBuilder ();
+
+            foreach (var k in curves.positionX.keys) {
+                sb.AppendFormat ("{0:F6} ", k.time);
+            }
+
+            string arrayId = string.Format ("{0}-array", inputID);
+            XmlNode flArrayNode = inputNode.AppendChild (this.xml.CreateElement ("float_array", COLLADA));
+            SetIdAttribute(flArrayNode, arrayId);
+            SetAttribute(flArrayNode, "count", keyCount.ToString());
+            flArrayNode.AppendChild(this.xml.CreateTextNode(sb.ToString()));
+
+            AddAnimationCurveTechniqueNode (inputNode, keyCount, 1, arrayId, "TIME", "float");
+        }
+
+        //output
+        string outputID = string.Format ("{0}-output", curveId);
+        {
+            XmlNode outputNode = curveNode.AppendChild (this.xml.CreateElement ("source", COLLADA));
+            SetIdAttribute(outputNode, outputID);
+
+            StringBuilder sb = new StringBuilder ();
+
+            for (int i = 0; i < curves.positionX.length; ++i) {
+                var mat = curves.CreateTransformMatrix (i); // already in right-handed coordinate
+                var matStr = FormtMatrix4x4ForCollada (ref mat);
+                sb.Append (matStr);
+            }
+
+            string arrayId = string.Format ("{0}-array", outputID);
+            XmlNode flArrayNode = outputNode.AppendChild (this.xml.CreateElement ("float_array", COLLADA));
+            SetIdAttribute(flArrayNode, arrayId);
+            SetAttribute(flArrayNode, "count", (keyCount * 16).ToString());
+            flArrayNode.AppendChild(this.xml.CreateTextNode(sb.ToString()));
+
+            AddAnimationCurveTechniqueNode (outputNode, keyCount, 16, arrayId, "TRANSFORM", "float4x4");
+        }
+
+        //interpolation
+        string interpolationID = string.Format ("{0}-interpolation", curveId);
+        {
+            XmlNode interpolationNode = curveNode.AppendChild (this.xml.CreateElement ("source", COLLADA));
+            SetIdAttribute(interpolationNode, interpolationID);
+
+            StringBuilder sb = new StringBuilder ();
+
+            foreach (var k in curves.positionX.keys) {
+                sb.Append ("LINEAR ");
+            }
+
+            string arrayId = string.Format ("{0}-array", outputID);
+            XmlNode flArrayNode = interpolationNode.AppendChild (this.xml.CreateElement ("Name_array", COLLADA));
+            SetIdAttribute(flArrayNode, arrayId);
+            SetAttribute(flArrayNode, "count", keyCount.ToString());
+            flArrayNode.AppendChild(this.xml.CreateTextNode(sb.ToString()));
+
+            AddAnimationCurveTechniqueNode (interpolationNode, keyCount, 1, arrayId, "INTERPOLATION", "name");
+        }
+
+        //sampler
+        string samplerID = string.Format ("{0}-sampler", curveId);
+        {
+            var samplerNode = curveNode.AppendChild (this.xml.CreateElement ("sampler", COLLADA));
+            SetIdAttribute(samplerNode, samplerID);
+
+            var sin = samplerNode.AppendChild (this.xml.CreateElement ("input", COLLADA));
+            SetAttribute(sin, "semantic", "INPUT");
+            SetAttribute(sin, "source", string.Format("#{0}", inputID));
+
+            var sout = samplerNode.AppendChild (this.xml.CreateElement ("input", COLLADA));
+            SetAttribute(sout, "semantic", "OUTPUT");
+            SetAttribute(sout, "source", string.Format("#{0}", outputID));
+
+            var sinterpol = samplerNode.AppendChild (this.xml.CreateElement ("input", COLLADA));
+            SetAttribute(sinterpol, "semantic", "INTERPOLATION");
+            SetAttribute(sinterpol, "source", string.Format("#{0}", interpolationID));
+        }
+
+        //channel
+        {
+            var channelNode = curveNode.AppendChild (this.xml.CreateElement ("channel", COLLADA));
+            SetAttribute(channelNode, "source", string.Format("#{0}", samplerID));
+            SetAttribute(channelNode, "target", string.Format("{0}/matrix", jointId));
+        }
+
+        return curveNode;
+    }
+
+    private void AddAnimationCurveTechniqueNode(XmlNode node, int count, int stride, string sourceId, string paramName, string paramType) {
+        XmlNode techniqueCommonNode = node.AppendChild (this.xml.CreateElement ("technique_common", COLLADA));
+        XmlNode accessorNode = techniqueCommonNode.AppendChild (this.xml.CreateElement ("accessor", COLLADA));
+        XmlNode paramNode = accessorNode.AppendChild (this.xml.CreateElement ("param", COLLADA));
+
+        SetAttribute(accessorNode, "source", string.Format("#{0}", sourceId));
+        SetAttribute(accessorNode, "count", count.ToString());
+        if (stride > 1) {
+            SetAttribute(accessorNode, "stride", stride.ToString());
+        }
+
+        SetAttribute(paramNode, "name", paramName);
+        SetAttribute(paramNode, "type", paramType);
+    }
+
+    public XmlNode AddObjectToScene(GameObject sourceObject, bool addMesh = true)
+    {
+        XmlNode node = this.default_scene.AppendChild (this.xml.CreateElement ("node", COLLADA));
+        SetNameIdAttributes (node, "NODE", sourceObject.name, MakeIdFromName (sourceObject.name), false);
+
+        XmlNode location = node.AppendChild (this.xml.CreateElement ("translate", COLLADA));
+        XmlNode rotationX = node.AppendChild (this.xml.CreateElement ("rotate", COLLADA));
+        XmlNode rotationY = node.AppendChild (this.xml.CreateElement ("rotate", COLLADA));
+        XmlNode rotationZ = node.AppendChild (this.xml.CreateElement ("rotate", COLLADA));
+        XmlNode scale   = node.AppendChild (this.xml.CreateElement ("scale", COLLADA));
+
+        Transform t = sourceObject.transform;
+
+        Matrix4x4 rot = new Matrix4x4 ();
+        var r = t.localRotation;
+        r = new Quaternion (-r.x, r.y, r.z, -r.w);
+
+        rot.SetTRS (Vector3.zero, r, Vector3.one);
+
+        SetSidAndText(location, "location", FormatVector(t.position));
+        SetSidAndText(rotationX, "rotationX", FormatVector(rot.GetRow(0)));
+        SetSidAndText(rotationY, "rotationY", FormatVector(rot.GetRow(1)));
+        SetSidAndText(rotationZ, "rotationZ", FormatVector(rot.GetRow(2)));
+        SetSidAndText(scale, "scale", FormatVector(t.localScale));
+
+        for (int i = 0; i < t.childCount; ++i) {
+            Transform child = t.GetChild (i);
+
+            var components = child.GetComponents<Component> ();
+
+            if (components.Length <= 1) {
+                AddJointToScene (child, node, addMesh);
+            } else {
+                AddNodeToScene (child, node, addMesh);
+            }
+        }
+        return node;
+    }
+
+    private void AddNodeToScene(Transform t, XmlNode parent, bool addMesh)
+    {
+        XmlNode node = parent.AppendChild (this.xml.CreateElement ("node", COLLADA));
+        SetNameIdAttributes (node, "NODE", t.name, MakeIdFromName (t.name), true);
+
+        XmlNode matrix = node.AppendChild (this.xml.CreateElement ("matrix", COLLADA));
+        SetSidAndText(matrix, "matrix", CreateMatrixStringFromTRSForCollada(t.localPosition, t.localRotation, t.localScale));
+
+        if (addMesh) {
+            AddMeshIfAny (t, node);
+        }
+    }
+
+    private void AddMeshIfAny(Transform t, XmlNode node) {
+        
+        var meshFilter = t.gameObject.GetComponent<MeshFilter> ();
+        var skinnedmesh = t.gameObject.GetComponent<SkinnedMeshRenderer> ();
+
+        Mesh mesh = null;
+        if (meshFilter != null) {
+            mesh = meshFilter.sharedMesh;
+        }
+
+        if (skinnedmesh != null) {
+            mesh = skinnedmesh.sharedMesh;
+        }
+
+        if (mesh != null) {
+            var geometryId = MakeIdFromName(mesh.name);
+            AddGeometry(geometryId, mesh.name, mesh);
+            AddGeometryInstanceToScene (geometryId, node);
+        }
+    }
+
+    private void AddJointToScene(Transform t, XmlNode parent, bool addMesh)
+    {
+        XmlNode node = parent.AppendChild (this.xml.CreateElement ("node", COLLADA));
+        SetNameIdAttributes (node, "JOINT", t.name, MakeIdFromName (t.name), true);
+
+        XmlNode matrix = node.AppendChild (this.xml.CreateElement ("matrix", COLLADA));
+
+        string text = CreateMatrixStringFromTRSForCollada (t.localPosition, t.localRotation, t.localScale);
+
+        SetSidAndText(matrix, "matrix", text);
+
+        if (addMesh) {
+            AddMeshIfAny (t, node);
+        }
+
+        for (int i = 0; i < t.childCount; ++i) {
+            Transform child = t.GetChild (i);
+            AddJointToScene (child, node, addMesh);
+        }
+    }
+
+    private string CreateMatrixStringFromTRSForCollada(Vector3 pos, Quaternion rot, Vector3 scale) {
+        Matrix4x4 mat = new Matrix4x4 ();
+        //convert right-hand system/left-hand system (to-from Collada(right) <-> Unity(left))
+        pos = new Vector3(-pos.x, pos.y, pos.z);
+        rot = new Quaternion (-rot.x, rot.y, rot.z, -rot.w);
+
+        mat.SetTRS (pos, rot, scale);
+
+        return FormtMatrix4x4ForCollada (ref mat);
+    }
+
+    private static string FormtMatrix4x4ForCollada(ref Matrix4x4 mat) {
+        return string.Format (
+            "\n{0:F6}\t{1:F6}\t{2:F6}\t{3:F6}\n{4:F6}\t{5:F6}\t{6:F6}\t{7:F6}\n{8:F6}\t{9:F6}\t{10:F6}\t{11:F6}\n{12:F6}\t{13:F6}\t{14:F6}\t{15:F6}\n",
+            mat.m00, mat.m01, mat.m02, mat.m03,
+            mat.m10, mat.m11, mat.m12, mat.m13,
+            mat.m20, mat.m21, mat.m22, mat.m23,
+            mat.m30, mat.m31, mat.m32, mat.m33
+            );
+    }
+
+    public XmlNode AddGeometry(Mesh sourceMesh) {
+        return AddGeometry(MakeIdFromName(sourceMesh.name), sourceMesh.name, sourceMesh);
+    }
+
+    private XmlNode AddGeometry(string id, string name, Mesh sourceMesh)
     {
         XmlNode geometry = this.geometries.AppendChild(this.xml.CreateElement("geometry", COLLADA));
         XmlNode mesh = geometry.AppendChild(this.xml.CreateElement("mesh", COLLADA));
@@ -203,6 +571,10 @@ public class ColladaExporter : IDisposable
 
         attr = this.xml.CreateAttribute("id");
         attr.Value = id + "-mesh";
+        geometry.Attributes.Append(attr);
+
+        attr = this.xml.CreateAttribute("name");
+        attr.Value = name;
         geometry.Attributes.Append(attr);
 
         // Positions
@@ -476,85 +848,16 @@ public class ColladaExporter : IDisposable
         return geometry;
     }
 
-    public XmlNode AddGeometryToScene(string id, string name)
+    private XmlNode AddGeometryInstanceToScene(string id, XmlNode parent)
     {
-        return AddGeometryToScene(id, name, Matrix4x4.identity, null);
-    }
-
-    public XmlNode AddGeometryToScene(string id, string name, Matrix4x4 matrix)
-    {
-        return AddGeometryToScene(id, name, matrix, null);
-    }
-
-    public XmlNode AddGeometryToScene(string id, string name, Matrix4x4 matrix, XmlNode parent)
-    {
-        XmlNode nodeA, nodeB;
+        XmlNode node;
         XmlAttribute attr;
 
-        if (parent == null)
-            parent = this.default_scene;
-
-        nodeA = parent.AppendChild(this.xml.CreateElement("node", COLLADA));
-        attr = this.xml.CreateAttribute("id");
-        attr.Value = id;
-        nodeA.Attributes.Append(attr);
-        attr = this.xml.CreateAttribute("type");
-        attr.Value = "Node";
-        nodeA.Attributes.Append(attr);
-        attr = this.xml.CreateAttribute("name");
-        attr.Value = name;
-        nodeA.Attributes.Append(attr);
-
-        nodeB = nodeA.AppendChild(this.xml.CreateElement("matrix", COLLADA));
-        attr = this.xml.CreateAttribute("sid");
-        attr.Value = "matrix";
-        nodeB.Attributes.Append(attr);
-        nodeB.AppendChild(this.xml.CreateTextNode(matrix.ToString()));
-
-        nodeB = nodeA.AppendChild(this.xml.CreateElement("instance_geometry", COLLADA));
+        node = parent.AppendChild(this.xml.CreateElement("instance_geometry", COLLADA));
         attr = this.xml.CreateAttribute("url");
         attr.Value = "#" + id + "-mesh";
-        nodeB.Attributes.Append(attr);
+        node.Attributes.Append(attr);
 
-        return nodeA;
+        return node;
     }
-
-    public XmlNode AddEmptyToScene(string id, string name)
-    {
-        return AddEmptyToScene(id, name, Matrix4x4.identity, null);
-    }
-
-    public XmlNode AddEmptyToScene(string id, string name, Matrix4x4 matrix)
-    {
-        return AddEmptyToScene(id, name, matrix, null);
-    }
-
-    public XmlNode AddEmptyToScene(string id, string name, Matrix4x4 matrix, XmlNode parent)
-    {
-        XmlNode nodeA, nodeB;
-        XmlAttribute attr;
-
-        if (parent == null)
-            parent = this.default_scene;
-
-        nodeA = parent.AppendChild(this.xml.CreateElement("node", COLLADA));
-        attr = this.xml.CreateAttribute("id");
-        attr.Value = id;
-        nodeA.Attributes.Append(attr);
-        attr = this.xml.CreateAttribute("type");
-        attr.Value = "Node";
-        nodeA.Attributes.Append(attr);
-        attr = this.xml.CreateAttribute("name");
-        attr.Value = name;
-        nodeA.Attributes.Append(attr);
-
-        nodeB = nodeA.AppendChild(this.xml.CreateElement("matrix", COLLADA));
-        attr = this.xml.CreateAttribute("sid");
-        attr.Value = "matrix";
-        nodeB.Attributes.Append(attr);
-        nodeB.AppendChild(this.xml.CreateTextNode(matrix.ToString()));
-
-        return nodeA;
-    }
-
 }
