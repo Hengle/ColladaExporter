@@ -14,8 +14,8 @@ Example Usage
 ----
 ```C#
 ColladaExporter export = new ColladaExporter("path/to/export.dae", replace_or_not);
-export.AddGeometry("MyMeshId", mesh_object);
-export.AddGeometryToScene("MyMeshId", "MyMeshName");
+export.AddObjectToScene (gameObject);
+export.AddAnimationClip (animationClip, gameObject);
 export.Save();
 ```
 
